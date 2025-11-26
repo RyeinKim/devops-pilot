@@ -1,49 +1,105 @@
-# 워크플로우 이름을 "Node.js CI"로 설정합니다.
-name: Node.js CI
+name: Node.js CI/CD
 
-# 어떤 이벤트가 발생했을 때 워크플로우를 실행할지 정의합니다.
 on:
-  push: # 코드가 저장소로 푸시될 때 워크플로우를 실행합니다.
+  push:
     branches:
-      - main # main 브랜치에 코드가 푸시될 때 실행합니다.
-  pull_request: # 풀 리퀘스트가 생성 또는 갱신될 때도 워크플로우를 실행합니다.
+      - main
+  pull_request:
     branches:
-      - main # main 브랜치로 풀 리퀘스트가 열리거나 갱신될 때 실행합니다.
+      - main
 
-# 실행할 작업을 정의하는 영역입니다.
 jobs:
-  build: # 작업의 이름을 "build"로 정의합니다.
-    runs-on: ubuntu-latest # 최신 Ubuntu 환경에서 작업을 수행합니다.
-
-    # 작업을 다양한 환경에서 병렬로 실행할 수 있도록 전략을 정의합니다.
+  test:
+    runs-on: ubuntu-latest
     strategy:
-      # 병렬 실행을 위한 환경 변수 집합을 설정합니다.
       matrix:
-        # Node.js 버전 19.x, 20.x, 22.x 환경에서 병렬로 작업을 실행합니다.
         node-version: [19.x, 20.x, 22.x]
 
-    # 각 작업에서 실행할 단계(step)들을 정의합니다.
     steps:
-      # 소스 코드를 체크아웃합니다.
-      - name: Checkout repository
-        # GitHub 공식 checkout 액션을 사용하여 저장소의 코드를 가져옵니다.
-        uses: actions/checkout@v2
-
-      # Node.js 환경을 설정합니다.
-      - name: Set up Node.js
-        # Node.js를 설치하기 위한 공식 액션을 사용합니다.
-        uses: actions/setup-node@v2
-        # 액션에 추가적인 매개변수를 전달합니다.
+      - uses: actions/checkout@v2
+      - uses: actions/setup-node@v2
         with:
-          # 설정한 Node.js 버전을 사용하여 환경을 세팅합니다.
           node-version: ${{ matrix.node-version }}
-
-      # 프로젝트의 의존성 패키지들을 설치합니다.
       - name: Install dependencies
-        # npm install 명령을 실행하여 의존성을 설치합니다.
         run: npm install
-
-      # 프로젝트의 테스트를 실행합니다.
       - name: Run tests
-        # npm test 명령을 실행하여 테스트를 수행합니다.
         run: npm test
+
+  build-and-push-image:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v2
+      - name: Docker Hub Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Build and Push Docker Image
+        run: |
+          docker build --platform linux/amd64 -t ${{ secrets.DOCKER_USERNAME }}/express-hello-world:latest .
+          docker push ${{ secrets.DOCKER_USERNAME }}/express-hello-world:latest
+
+  deploy:
+    needs: build-and-push-image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare SSH Key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts
+      - name: Check if Docker is installed
+        id: check-docker
+        run: |
+          DOCKER_EXISTS=$(ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'command -v docker >/dev/null && echo "true" || echo "false"')
+          echo "docker_exists=$DOCKER_EXISTS" >> $GITHUB_OUTPUT
+
+      - name: Check if Node.js is installed
+        id: check-nodejs
+        run: |
+          NODE_EXISTS=$(ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} 'command -v node >/dev/null && echo "true" || echo "false"')
+          echo "node_exists=$NODE_EXISTS" >> $GITHUB_OUTPUT
+
+      - name: Install Docker on EC2
+        if: steps.check-docker.outputs.docker_exists == 'false'
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            sudo apt-get update
+            sudo apt-get install -y \
+              ca-certificates \
+              curl \
+              gnupg \
+              lsb-release
+            sudo mkdir -p /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+              | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+            echo \
+              "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+              https://download.docker.com/linux/ubuntu \
+              $(lsb_release -cs) stable" \
+              | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+            sudo apt-get update
+            sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+            sudo usermod -aG docker $USER
+          EOF
+
+      - name: Install Node.js on EC2
+        if: steps.check-nodejs.outputs.node_exists == 'false'
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+          EOF
+
+      - name: Deploy to EC2 via Docker Compose
+        run: |
+          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd /home/${{ secrets.SERVER_USER }}/backend
+            docker compose pull
+            docker compose up -d
+          EOF
